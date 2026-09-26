@@ -5,12 +5,12 @@ Aplikasi web untuk database koperasi `kudbantarangin`. Web ini memakai
 berdampingan.
 
 ```
- Browser  ──HTTPS──▶  VPS APLIKASI                          VPS DATABASE
-                      ┌─────────────────────────────┐       ┌──────────────────────┐
-                      │ Nginx                        │       │ MySQL / MariaDB      │
-                      │  ├─ /      → frontend/dist   │       │  kudbantarangin      │
-                      │  └─ /api   → Node.js :3000 ──┼──────▶│  + stored procedure  │
-                      └─────────────────────────────┘ 3306  └──────────────────────┘
+ Browser ──HTTPS──▶ VPS APLIKASI (wg 10.10.0.2)         VPS DATABASE (wg 10.10.0.1)
+                    ┌──────────────────────────┐        ┌───────────────────────┐
+                    │ Nginx                    │        │ MariaDB               │
+                    │  ├─ /    → frontend/dist │  Wire  │  kudbantarangin       │
+                    │  └─ /api → Node.js :3000 ┼─Guard─▶│  + stored procedure   │
+                    └──────────────────────────┘  3306  └───────────────────────┘
 ```
 
 | Folder      | Isi                                                                 |
@@ -54,25 +54,78 @@ untuk login sama dengan yang dipakai di aplikasi desktop.
 
 ## Instalasi
 
-### 1. Di VPS DATABASE: izinkan koneksi dari VPS aplikasi
+### 1. Hubungkan kedua VPS lewat WireGuard
+
+VPS database sudah memakai WireGuard dengan IP `10.10.0.1`. VPS aplikasi
+dijadikan *peer* dengan IP baru, misalnya `10.10.0.2`. Pastikan IP itu belum
+dipakai peer lain (cek dengan `sudo wg show` di VPS database).
+
+**Di VPS APLIKASI**, pasang WireGuard dan buat kunci:
+
+```bash
+sudo apt install -y wireguard
+wg genkey | sudo tee /etc/wireguard/private.key | wg pubkey | sudo tee /etc/wireguard/public.key
+sudo chmod 600 /etc/wireguard/private.key
+```
+
+Buat `/etc/wireguard/wg0.conf`:
+
+```ini
+[Interface]
+PrivateKey = <isi private.key VPS aplikasi>
+Address = 10.10.0.2/24
+
+[Peer]
+# VPS database
+PublicKey = <public key WireGuard VPS database>
+Endpoint = <IP_PUBLIK_VPS_DATABASE>:51820
+AllowedIPs = 10.10.0.1/32
+PersistentKeepalive = 25
+```
+
+**Di VPS DATABASE**, tambahkan peer baru di `/etc/wireguard/wg0.conf`:
+
+```ini
+[Peer]
+# VPS aplikasi
+PublicKey = <isi public.key VPS aplikasi>
+AllowedIPs = 10.10.0.2/32
+```
+
+Aktifkan di kedua VPS, lalu uji dari VPS aplikasi:
+
+```bash
+sudo systemctl enable --now wg-quick@wg0      # di VPS aplikasi
+sudo systemctl restart wg-quick@wg0           # di VPS database
+ping -c 3 10.10.0.1                           # dari VPS aplikasi
+```
+
+### 2. Di VPS DATABASE: izinkan MariaDB diakses lewat WireGuard
 
 1. Buat user khusus untuk web. Hak aksesnya hanya **SELECT** dan **EXECUTE**,
-   jadi tidak bisa menghapus atau mengubah tabel secara langsung.
-   Ganti `IP_VPS_APLIKASI` dengan IP VPS aplikasi (sebaiknya IP privat/VPN):
+   jadi tidak bisa menghapus atau mengubah tabel secara langsung. User ini
+   hanya bisa login dari IP WireGuard VPS aplikasi:
 
    ```sql
-   CREATE USER 'koperasi_api'@'IP_VPS_APLIKASI' IDENTIFIED BY 'password_kuat_di_sini';
-   GRANT SELECT, EXECUTE ON kudbantarangin.* TO 'koperasi_api'@'IP_VPS_APLIKASI';
+   CREATE USER 'koperasi_api'@'10.10.0.2' IDENTIFIED BY 'password_kuat_di_sini';
+   GRANT SELECT, EXECUTE ON kudbantarangin.* TO 'koperasi_api'@'10.10.0.2';
    FLUSH PRIVILEGES;
    ```
 
-2. Pastikan MySQL mendengarkan di jaringan. Di `my.cnf`, `bind-address` harus
-   berisi IP privat VPS database atau `0.0.0.0`, bukan `127.0.0.1`.
-3. **Batasi port 3306 dengan firewall** supaya hanya VPS aplikasi yang bisa
-   mengakses:
+2. Buat MariaDB mendengarkan di jaringan. Di `/etc/mysql/mariadb.conf.d/50-server.cnf`
+   (atau `my.cnf`), bagian `[mysqld]`, isi `bind-address = 0.0.0.0`, lalu
+   `sudo systemctl restart mariadb`.
+   Jangan isi `10.10.0.1`: kalau MariaDB menyala lebih dulu dari WireGuard
+   saat reboot, MariaDB akan gagal start.
+3. **Buka port 3306 hanya di antarmuka WireGuard**, supaya tidak bisa
+   diakses dari internet:
 
    ```bash
-   sudo ufw allow from IP_VPS_APLIKASI to any port 3306 proto tcp
+   sudo ufw allow OpenSSH                         # WAJIB dulu supaya SSH tidak terkunci
+   sudo ufw allow 51820/udp                       # port WireGuard
+   sudo ufw allow in on wg0 to any port 3306 proto tcp
+   sudo ufw enable
+   sudo ufw status
    ```
 
 4. Biarkan `lower_case_table_names=1` tetap aktif. Stored procedure menulis
@@ -81,10 +134,11 @@ untuk login sama dengan yang dipakai di aplikasi desktop.
 Uji dari VPS aplikasi:
 
 ```bash
-mysql -h IP_VPS_DATABASE -u koperasi_api -p kudbantarangin -e "CALL Cabang()"
+sudo apt install -y mariadb-client
+mysql -h 10.10.0.1 -u koperasi_api -p kudbantarangin -e "CALL Cabang()"
 ```
 
-### 2. Di VPS APLIKASI: pasang API dan web
+### 3. Di VPS APLIKASI: pasang API dan web
 
 Butuh Node.js 18 atau lebih baru, dan Nginx.
 
@@ -97,7 +151,7 @@ sudo chown -R $USER koperasife && cd koperasife
 cd backend
 npm ci --omit=dev
 cp .env.example .env
-nano .env            # isi DB_HOST, DB_PASSWORD, JWT_SECRET, ROLE_ADMIN, ROLE_PENGURUS
+nano .env            # DB_HOST=10.10.0.1, isi DB_PASSWORD, JWT_SECRET, ROLE_ADMIN, ROLE_PENGURUS
                      # JWT_SECRET bisa dibuat dengan: openssl rand -hex 32
                      # STATIC_DIR boleh dikosongkan karena web disajikan oleh Nginx
 
