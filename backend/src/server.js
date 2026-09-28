@@ -72,6 +72,6 @@ app.use((err, req, res, next) => {
   });
 });
 
-app.listen(config.port, () => {
+app.listen(config.port, '127.0.0.1', () => {
   console.log(`API koperasi berjalan di port ${config.port}`);
 });
